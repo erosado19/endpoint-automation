@@ -285,3 +285,68 @@ def test_cli_end_to_end(tmp_path):
     assert by_dom == {"nycexample": 2, "example.com": 1}
     rules = [r.formula[0] for cf in wb["All users"].conditional_formatting for r in cf.rules]
     assert any("Inactive" in f for f in rules) and any("Warning" in f for f in rules)
+
+
+# ------------------------------------------------------------ deletion notice
+
+NOTICE_CSV = ("Email,Last Logon\n"
+              "active@example.com,2026-11-10\n"
+              "old@example.com,2026-06-01\n"
+              "old@nycexample,2026-01-01\n"
+              "never@nycexample,Never\n")
+
+
+def test_notice_lists_inactive_and_unknown_by_domain(tmp_path):
+    src = tmp_path / "n.csv"
+    src.write_text(NOTICE_CSV, encoding="utf-8")
+    assert audit.main([str(src), "--as-of", "2026-11-15", "--delete-on", "2026-12-01"]) == 0
+    text = (tmp_path / "n_deletion_notice_2026-11-15.txt").read_text(encoding="utf-8-sig")
+    assert "2026-12-01 (Tuesday)" in text
+    assert "more than 90 days" in text
+    assert "== example.com (1 account) ==" in text and "== nycexample (1 account) ==" in text
+    assert "old@example.com" in text and "old@nycexample" in text
+    assert "active@example.com" not in text
+    assert "Last sign-in unknown (1)" in text and "never@nycexample" in text
+    assert "Total accounts scheduled for deletion: 3" in text
+    assert "No accounts were changed or deleted" in text
+
+    ws = load_workbook(tmp_path / "n_user_audit_2026-11-15.xlsx")["Deletion notice"]
+    rows = list(ws.iter_rows(values_only=True))
+    assert rows[0][-1] == "Scheduled deletion" and len(rows) == 4
+    assert all(str(r[-1]).startswith("2026-12-01") for r in rows[1:])
+
+
+def test_notice_default_grace_days(tmp_path):
+    src = tmp_path / "n.csv"
+    src.write_text(NOTICE_CSV, encoding="utf-8")
+    assert audit.main([str(src), "--as-of", "2026-11-15", "--notice"]) == 0
+    assert "2026-11-29" in (tmp_path / "n_deletion_notice_2026-11-15.txt").read_text(encoding="utf-8-sig")
+    assert audit.main([str(src), "--as-of", "2026-11-15", "--notice", "--grace-days", "30"]) == 0
+    assert "2026-12-15" in (tmp_path / "n_deletion_notice_2026-11-15.txt").read_text(encoding="utf-8-sig")
+
+
+def test_notice_when_nobody_is_inactive(tmp_path):
+    src = tmp_path / "n.csv"
+    src.write_text("Email,Last Logon\na@x.com,2026-11-10\n", encoding="utf-8")
+    assert audit.main([str(src), "--as-of", "2026-11-15", "--notice"]) == 0
+    text = (tmp_path / "n_deletion_notice_2026-11-15.txt").read_text(encoding="utf-8-sig")
+    assert "No accounts are scheduled for deletion." in text and "deletion: 0" in text
+
+
+def test_no_notice_unless_asked(tmp_path):
+    src = tmp_path / "n.csv"
+    src.write_text(NOTICE_CSV, encoding="utf-8")
+    assert audit.main([str(src), "--as-of", "2026-11-15"]) == 0
+    assert not list(tmp_path.glob("*deletion_notice*"))
+    assert "Deletion notice" not in load_workbook(tmp_path / "n_user_audit_2026-11-15.xlsx").sheetnames
+
+
+@pytest.mark.parametrize("extra", [
+    ["--delete-on", "2026-11-15"], ["--delete-on", "2026-11-01"], ["--delete-on", "12/01/2026"],
+    ["--notice", "--grace-days", "0"],
+])
+def test_bad_notice_options_return_2(tmp_path, extra):
+    src = tmp_path / "n.csv"
+    src.write_text(NOTICE_CSV, encoding="utf-8")
+    assert audit.main([str(src), "--as-of", "2026-11-15"] + extra) == 2
+    assert not list(tmp_path.glob("*.xlsx")) and not list(tmp_path.glob("*.txt"))

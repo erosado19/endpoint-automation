@@ -377,6 +377,8 @@ def write_report(out, result, source_name):
               ("Raw export", result["raw"])]
     if result["excluded"]:
         sheets.append(("Excluded", pd.DataFrame({"Account": result["excluded"]})))
+    if result.get("notice") is not None:
+        sheets.append(("Deletion notice", result["notice"]))
     if len(result["raw"]) > 1_048_000:
         raise AuditError("The export has more rows than Excel allows on one sheet.")
     try:
@@ -404,6 +406,76 @@ def write_report(out, result, source_name):
         raise AuditError(f"Couldn't write {out}. Close it in Excel and run again.")
 
 
+# ---------------------------------------------------------------- deletion notice
+
+def notice_table(result, delete_on):
+    """Accounts that would be deleted on delete_on: everyone Inactive or with No date."""
+    u = result["users"]
+    t = u[u["Audit Status"].str.startswith(("Inactive", "No date"))]
+    t = t[["Account", "Domain", "Last Activity", "Days Inactive", "Audit Status"]].copy()
+    t["Scheduled deletion"] = delete_on.date()
+    return t.reset_index(drop=True)
+
+
+def write_notice(path, notice, as_of, delete_on, days, source_name):
+    """Write a plain-text notice listing the accounts scheduled for deletion.
+
+    Only writes a file. The script never deletes or changes any account.
+    """
+    when = f"{delete_on.date().isoformat()} ({delete_on.strftime('%A')})"
+    lines = [
+        "ACCOUNT DELETION NOTICE",
+        "=" * 60,
+        f"Audit date:      {as_of.date().isoformat()}",
+        f"Deletion date:   {when}",
+        f"Source export:   {source_name}",
+        "",
+        f"The user accounts below have not signed in for more than {days} days.",
+        f"They will be deleted on {when} unless the user",
+        "signs in before that date.",
+        "",
+        f"If you still need your account, sign in before {delete_on.date().isoformat()}",
+        "or contact IT.",
+        "",
+    ]
+
+    def table(rows):
+        out = []
+        width = max([len("Account")] + [len(a) for a in rows["Account"]]) + 2
+        out.append(f"  {'Account':<{width}}{'Last sign-in':<14}Days inactive")
+        out.append(f"  {'-' * (width - 2):<{width}}{'-' * 12:<14}{'-' * 13}")
+        for _, r in rows.iterrows():
+            last = str(r["Last Activity"]) if pd.notna(r["Days Inactive"]) else "unknown"
+            d = str(r["Days Inactive"]) if pd.notna(r["Days Inactive"]) else "-"
+            out.append(f"  {r['Account']:<{width}}{last:<14}{d}")
+        return out
+
+    inactive = notice[notice["Audit Status"].str.startswith("Inactive")]
+    unknown = notice[notice["Audit Status"] == "No date"]
+    if inactive.empty and unknown.empty:
+        lines.append("No accounts are scheduled for deletion.")
+    for dom, rows in inactive.groupby("Domain", sort=True):
+        lines.append(f"== {dom} ({len(rows)} account{'s' if len(rows) != 1 else ''}) ==")
+        lines += table(rows) + [""]
+    if not unknown.empty:
+        lines.append(f"== Last sign-in unknown ({len(unknown)}): confirm these before deleting ==")
+        lines += table(unknown) + [""]
+    lines += ["-" * 60,
+              f"Total accounts scheduled for deletion: {len(notice)}",
+              "This file is a notice only. No accounts were changed or deleted."]
+    try:
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    except PermissionError:
+        raise AuditError(f"Couldn't write {path}. Close it and run again.")
+
+
+def parse_ymd(value, option):
+    try:
+        return pd.Timestamp(datetime.strptime(value, "%Y-%m-%d"))
+    except ValueError:
+        raise AuditError(f"{option} must look like 2026-09-30, got '{value}'.")
+
+
 # ---------------------------------------------------------------- command line
 
 def main(argv=None):
@@ -419,16 +491,25 @@ def main(argv=None):
     p.add_argument("--dayfirst", action="store_true", help="Dates like 03/04/2026 are DD/MM/YYYY")
     p.add_argument("--exclude", help="Text file of accounts to skip, one per line")
     p.add_argument("--out", help="Output .xlsx (default: <csv name>_user_audit_<date>.xlsx)")
+    p.add_argument("--notice", action="store_true",
+                   help="Also write a text file listing accounts to be deleted if the user doesn't sign in")
+    p.add_argument("--delete-on", help="Deletion date for the notice, YYYY-MM-DD (implies --notice)")
+    p.add_argument("--grace-days", type=int, default=14,
+                   help="Days from the audit date to the deletion date when --delete-on isn't given (default 14)")
     a = p.parse_args(argv)
 
     try:
-        if a.as_of:
-            try:
-                as_of = pd.Timestamp(datetime.strptime(a.as_of, "%Y-%m-%d"))
-            except ValueError:
-                raise AuditError(f"--as-of must look like 2026-09-30, got '{a.as_of}'.")
-        else:
-            as_of = pd.Timestamp(datetime.now().date())
+        as_of = parse_ymd(a.as_of, "--as-of") if a.as_of else pd.Timestamp(datetime.now().date())
+        delete_on = None
+        if a.notice or a.delete_on:
+            if a.delete_on:
+                delete_on = parse_ymd(a.delete_on, "--delete-on")
+            elif a.grace_days < 1:
+                raise AuditError("--grace-days must be at least 1.")
+            else:
+                delete_on = as_of + pd.Timedelta(days=a.grace_days)
+            if delete_on <= as_of:
+                raise AuditError(f"--delete-on ({delete_on.date()}) must be after the audit date ({as_of.date()}).")
 
         src = Path(a.csv)
         df = read_csv_any(src)
@@ -444,10 +525,17 @@ def main(argv=None):
                            exclude=load_exclusions(a.exclude),
                            dayfirst=True if a.dayfirst else None)
 
+        if delete_on is not None:
+            result["notice"] = notice_table(result, delete_on)
+
         out = Path(a.out) if a.out else src.with_name(f"{src.stem}_user_audit_{as_of.date().isoformat()}.xlsx")
         if out.resolve() == src.resolve():
             raise AuditError("--out can't be the same file as the input CSV.")
         write_report(out, result, src.name)
+        notice_path = None
+        if delete_on is not None:
+            notice_path = out.with_name(f"{src.stem}_deletion_notice_{as_of.date().isoformat()}.txt")
+            write_notice(notice_path, result["notice"], as_of, delete_on, a.days, src.name)
     except AuditError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -463,6 +551,9 @@ def main(argv=None):
     for w in result["warnings"]:
         print("NOTE:", w)
     print(f"Report written to {out}")
+    if notice_path:
+        print(f"Deletion notice written to {notice_path}  "
+              f"({len(result['notice'])} account(s), deletion date {delete_on.date()})")
     return 0
 
 

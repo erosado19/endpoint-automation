@@ -55,16 +55,41 @@ Useful options:
 | `--dayfirst` | Dates like 03/04/2026 are DD/MM/YYYY (the script detects this when it can) |
 | `--out audit.xlsx` | Choose the output file name |
 
+### Deletion notice
+
+Add `--notice` to also write a text file listing the accounts that will be deleted
+if the user doesn't sign in:
+
+```
+python edr_90day_audit.py edr_export.csv --delete-on 2026-12-01
+python edr_90day_audit.py edr_export.csv --notice --grace-days 30
+```
+
+| Option | What it does |
+|---|---|
+| `--notice` | Write the notice. The deletion date is 14 days after the audit date |
+| `--delete-on 2026-12-01` | Use this exact deletion date (turns on `--notice`) |
+| `--grace-days 30` | Days from the audit date to the deletion date (default 14) |
+
+The notice (`<csv name>_deletion_notice_<date>.txt`) lists the inactive accounts
+grouped by domain, with each one's last sign-in and days inactive. Accounts with
+no date are listed separately under "Last sign-in unknown", so you can check them
+before deleting. The same list is added to the Excel report as a **Deletion notice**
+sheet. **The script never deletes or changes any account. It only writes the notice.**
+
+### Exclude file
+
 In the exclude file, `svc_backup@example.com` skips only that tenant's account, while a
 bare `svc_backup` skips that name in every tenant. Lines starting with `#` are ignored.
 
-The output Excel file has five sheets:
+The output Excel file has these sheets:
 - **Summary**: counts for your audit record
 - **By domain**: active, inactive and no-date counts for each tenant or domain
 - **Needs review**: users inactive more than 90 days, plus users with no date (highlighted)
 - **All users**: one row per account (with its domain), most inactive first
 - **Raw export**: the original rows, for evidence
 - **Excluded**: the accounts your exclude file removed (only when you use `--exclude`)
+- **Deletion notice**: accounts scheduled for deletion and the date (only with `--notice`)
 
 Notes on dates:
 - "Inactive" means **more than** 90 days, so exactly 90 days still counts as active.
@@ -91,8 +116,18 @@ python cis_scores_to_excel.py "C:\path\to\cis_reports" --workbook CIS_Scores.xls
 Set `--fy-start-month` to the month your fiscal year starts (1 = January, 7 = July,
 10 = October). Fiscal years are named by the year they end in, so Oct 2025 to Sep 2026 is FY26.
 
-The script reads the score, host, benchmark name and report date from each PDF,
-works out the fiscal quarter, and writes the score in the matching column:
+The script reads the score, host, benchmark name and report date from each report,
+works out the fiscal quarter, and writes the score in the matching column.
+
+**PDFs with many reports:** a single PDF can hold any number of reports (35 reports
+and 500+ pages take a few seconds). Each report starts with the word **Compliant**,
+and the script finds them the way Ctrl+F does. The PDF is not changed or split on
+disk. Each report is logged with its page number (e.g. `batch.pdf p.37`) so you can
+check it. If the start word ever changes, use `--split-on "New Word"`.
+"Non-Compliant" never counts as a report start. Anything before the first
+"Compliant", such as a cover page, is ignored.
+
+The result looks like this:
 
 | Host | Benchmark | FY26 Q1 | FY26 Q2 |
 |---|---|---|---|
@@ -133,7 +168,7 @@ the dates inside them.
 
 ## Running the tests
 
-The `tests` folder holds 123 automated checks covering multi-tenant names,
+The `tests` folder holds 143 automated checks covering multi-tenant names,
 date formats, thresholds, bad files, encrypted PDFs, formula injection and
 CLI errors. To run them (they need `pytest` and `reportlab`, for testing only):
 

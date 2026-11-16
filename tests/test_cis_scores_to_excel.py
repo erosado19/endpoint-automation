@@ -6,7 +6,7 @@ from openpyxl import Workbook, load_workbook
 
 import cis_scores_to_excel as cis
 from cis_scores_to_excel import CisError, fiscal_quarter, normalize_quarter, parse_date, extract_report
-from conftest import report_lines
+from conftest import report_lines, compliant_report
 
 
 def scores(path):
@@ -239,3 +239,102 @@ def test_formula_like_file_name_stored_as_text(tmp_path, make_pdf):
             if name.startswith("xl/worksheets/"):
                 assert "<f>" not in z.read(name).decode("utf-8"), name
     assert scores(wb)[1].popitem()[0][0] == "=HYPERLINK(1)"
+
+
+# ------------------------------------------------------------ CIS dashboard layout (Azure sample)
+
+AZURE_TEXT = """Center for Internet Security
+Albert Enterprises
+Last Updated Time: 4/1/2020 1:09:04 PM (GMT)
+CIS Microsoft Azure Foundations Benchmark (v1.1.0)
+Deployment Name
+Development Azure Environment
+Section
+(All)
+Passed Checks
+64.5% (20)
+Partially Passed Checks
+0.0% (0)
+Failed Checks
+35.5% (11)
+Check Name List
+1 Identity and Access Management Ensure that there are no guest users 1/1 Passed"""
+
+
+def test_azure_dashboard_layout():
+    info, notes = extract_report(AZURE_TEXT, "file")
+    assert info["score"] == 64.5
+    assert info["host"] == "Development Azure Environment"
+    assert info["date"] == datetime(2020, 4, 1)
+    assert info["bench"] == "CIS Microsoft Azure Foundations Benchmark (v1.1.0)"
+    assert notes == []
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Compliant: 78.5%", 78.5), ("COMPLIANT 91%", 91.0), ("Compliance Score: 66%", 66.0),
+    ("Non-Compliant: 20%\nCompliant: 80%", 80.0),
+])
+def test_compliant_score_wording(text, expected):
+    info, _ = extract_report(text + "\nHostname: A", "x")
+    assert info["score"] == expected
+
+
+# ------------------------------------------------------------ multi-report PDFs
+
+def test_split_reports_pages_and_non_compliant():
+    pages = ["cover page", "Compliant: 80%\nHostname: A", "more of A  Non-Compliant  NonCompliant",
+             "Compliant: 70%\nHostname: B", "Compliant: 60%\nHostname: C"]
+    parts = cis.split_reports(pages)
+    assert [p for p, _ in parts] == [2, 4, 5]
+    assert "more of A" in parts[0][1] and "Hostname: B" not in parts[0][1]
+
+
+@pytest.mark.parametrize("pages,marker", [(["Total Score: 80%", "page 2"], "Compliant"),
+                                          (["Compliant: 80%", "Compliant: 70%"], "")])
+def test_no_split_gives_one_report(pages, marker):
+    assert len(cis.split_reports(pages, marker)) == 1
+
+
+def test_multi_report_pdf_records_every_report(tmp_path, make_pdf, capsys):
+    lines = ["Quarterly CIS export - cover page"]
+    for i in range(35):
+        lines += compliant_report(f"WS-{i:03d}", f"2026-0{1 + i % 3}-15", 60 + i % 40, pages=1 + i % 3)
+    pdf = make_pdf("batch.pdf", lines)
+    wb = tmp_path / "s.xlsx"
+    assert run([pdf, "--workbook", wb, "--fy-start-month", "10"]) == 0
+    out = capsys.readouterr().out
+    assert "35 reports found" in out
+    header, data = scores(wb)
+    assert len(data) == 35
+    assert data[("WS-000", "CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0")]["FY26 Q2"] == 60
+    assert data[("WS-034", "CIS Microsoft Windows 11 Enterprise Benchmark v3.0.0")]["FY26 Q2"] == 94
+    log = list(load_workbook(wb)[cis.LOG_SHEET].iter_rows(min_row=2, values_only=True))
+    assert len(log) == 35 and log[0][1] == "batch.pdf p.2"     # page number recorded for tracing
+
+
+def test_multi_report_missing_host_stays_separate(tmp_path, make_pdf, capsys):
+    lines = ["\f", "Compliant: 80%", "Scan Date: 2026-02-01", "\f", "Compliant: 70%", "Scan Date: 2026-02-01"]
+    wb = tmp_path / "s.xlsx"
+    assert run([make_pdf("b.pdf", lines), "--workbook", wb]) == 0
+    hosts = sorted(k[0] for k in scores(wb)[1])
+    assert hosts == ["b p.2", "b p.3"]
+    assert "b.pdf p.2: no host name found" in capsys.readouterr().out
+
+
+def test_large_pdf_500_pages(tmp_path, make_pdf):
+    lines = []
+    for i in range(35):
+        lines += compliant_report(f"SRV-{i:02d}", "2026-02-10", 75.5, pages=15)   # 35 x 15 = 525 pages
+    pdf = make_pdf("big.pdf", lines)
+    assert len(cis.pdf_pages(pdf)) >= 500
+    wb = tmp_path / "s.xlsx"
+    assert run([pdf, "--workbook", wb]) == 0
+    assert len(scores(wb)[1]) == 35
+
+
+def test_split_on_option(tmp_path, make_pdf):
+    lines = ["REPORT START", "Total Score: 80%", "Hostname: A", "Scan Date: 2026-02-01", "\f",
+             "REPORT START", "Total Score: 70%", "Hostname: B", "Scan Date: 2026-02-01"]
+    wb = tmp_path / "s.xlsx"
+    assert run([make_pdf("c.pdf", lines), "--workbook", wb, "--split-on", "REPORT START"]) == 0
+    assert sorted(k[0] for k in scores(wb)[1]) == ["A", "B"]

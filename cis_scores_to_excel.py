@@ -19,6 +19,7 @@ import argparse
 import re
 import shutil
 import sys
+from bisect import bisect_right
 from datetime import datetime
 from pathlib import Path
 
@@ -38,18 +39,28 @@ SCORE_PATTERNS = [
     rf"\bTotal\s+Score\s*[:\-]?\s*{NUM}\s*%",
     rf"\bOverall\s+Score\s*[:\-]?\s*{NUM}\s*%",
     rf"\bBenchmark\s+Score\s*[:\-]?\s*{NUM}\s*%",
+    rf"(?<![\w-])Compliant\s*[:\-]?\s*{NUM}\s*%",          # "Compliant: 78%" (not "Non-Compliant")
+    rf"\bCompliance(?:\s+Score)?\s*[:\-]?\s*{NUM}\s*%",
+    rf"\bPassed\s+Checks\s*[:\-]?\s*{NUM}\s*%",            # CIS dashboard: "Passed Checks 64.5% (20)"
     rf"\bTotal\s+[\d.]+\s+[\d.]+\s+{NUM}\s*%",   # summary table row: Total <pass> <fail> <pct>%
     rf"\bScore\s*[:\-]\s*{NUM}\s*%",
 ]
 HOST_PATTERNS = [
     r"\b(?:Target\s+)?Host\s*name\s*[:\-]?\s*([A-Za-z0-9][\w.\-]*)",
     r"\bComputer\s+Name\s*[:\-]?\s*([A-Za-z0-9][\w.\-]*)",
+    r"\b(?:Asset|Device|Endpoint|Machine|System)\s+Name\s*[:\-]?\s*([A-Za-z0-9][\w.\-]*)",
+    r"\bDeployment\s+Name\s*[:\-]?\s*([A-Za-z0-9][^\n]{0,80})",   # may contain spaces
     r"\bTarget\s*[:\-]\s*([A-Za-z0-9][\w.\-]*)",
+    r"\bHost\s*[:\-]\s*([A-Za-z0-9][\w.\-]*)",
 ]
 DATE_LABELS = [
     r"\b(?:Assessment|Scan|Report|Start)\s+(?:Date|Time)\s*[:\-]?\s*([^\n]{6,40})",
+    r"\bLast\s+(?:Updated|Scanned)\s*(?:Time|Date|On)?\s*[:\-]?\s*([^\n]{6,40})",
+    r"\b(?:Scanned|Assessed|Generated)\s+(?:On|At|Date)\s*[:\-]?\s*([^\n]{6,40})",
     r"\bDate\s*[:\-]\s*([^\n]{6,40})",
 ]
+# Each report in a multi-report PDF starts with this word. Change it with --split-on.
+DEFAULT_SPLIT = "Compliant"
 MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?"
 DATE_SHAPES = [
     (re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})"), "ymd"),
@@ -58,7 +69,7 @@ DATE_SHAPES = [
     (re.compile(rf"({MONTHS})\s+(\d{{1,2}}),?\s+(\d{{4}})", re.I), "Mdy"),
     (re.compile(rf"(\d{{1,2}})\s+({MONTHS}),?\s+(\d{{4}})", re.I), "dMy"),
 ]
-BENCH_PATTERN = r"(CIS\s+[^\n]{3,90}?Benchmark(?:\s+v?\d+(?:\.\d+)*)?)"
+BENCH_PATTERN = r"(CIS\s+[^\n]{3,90}?Benchmark(?:\s+\(?v?\d+(?:\.\d+)*\)?)?)"
 QUARTER_RE = re.compile(r"^\s*FY\s*'?(\d{2}|\d{4})\s*[- ]?\s*Q([1-4])\s*$", re.I)
 
 SCORES_SHEET, LOG_SHEET = "CIS Scores", "Import log"
@@ -73,14 +84,41 @@ class CisError(Exception):
 
 # ---------------------------------------------------------------- reading PDFs
 
-def pdf_text(path):
+def pdf_pages(path):
+    """Return the text of each page, in order."""
     reader = PdfReader(str(path))
     if reader.is_encrypted:
         try:
             reader.decrypt("")
         except Exception:
             raise CisError("PDF is password protected")
-    return "\n".join((pg.extract_text() or "") for pg in reader.pages)
+    return [(pg.extract_text() or "") for pg in reader.pages]
+
+
+def pdf_text(path):
+    return "\n".join(pdf_pages(path))
+
+
+def split_reports(pages, marker=DEFAULT_SPLIT):
+    """Cut a PDF's text into separate reports, each starting at the marker word.
+
+    Returns a list of (first page number, report text). A PDF without the marker,
+    or with marker set to "", is treated as one report. "Non-Compliant" and
+    "NonCompliant" don't count as a report start.
+    """
+    starts, pos = [], 0
+    for p in pages:
+        starts.append(pos)
+        pos += len(p) + 1
+    text = "\n".join(pages)
+    if not marker:
+        return [(1, text)]
+    rx = re.compile(rf"(?<![\w-]){re.escape(marker)}(?![\w])", re.IGNORECASE)
+    hits = [m.start() for m in rx.finditer(text)]
+    if not hits:
+        return [(1, text)]
+    bounds = hits + [len(text)]
+    return [(bisect_right(starts, a), text[a:b]) for a, b in zip(bounds, bounds[1:])]
 
 
 def first(patterns, text):
@@ -273,7 +311,7 @@ def collect_files(inputs):
 
 
 def process(files, wb, fy_start_month=1, quarter=None, score_patterns=SCORE_PATTERNS,
-            overwrite=False, dayfirst=False):
+            overwrite=False, dayfirst=False, split_on=DEFAULT_SPLIT):
     ws, log = wb[SCORES_SHEET], wb[LOG_SHEET]
     cols, table = load_table(ws)
     if quarter is not None:
@@ -286,14 +324,24 @@ def process(files, wb, fy_start_month=1, quarter=None, score_patterns=SCORE_PATT
     seen_this_run = {}     # (key, quarter) -> report date, to keep the newest of two scans
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    reports = []     # (label for messages and log, fallback host, text, file)
     for f in files:
         try:
-            text = pdf_text(f)
+            pages = pdf_pages(f)
         except Exception as e:
             problems.append(f"{f.name}: could not read PDF ({e})")
             continue
-        info, notes = extract_report(text, f.stem, score_patterns, dayfirst=dayfirst)
-        problems += [f"{f.name}: {n}" for n in notes]
+        parts = split_reports(pages, split_on)
+        if len(parts) > 1:
+            print(f"{f.name}: {len(pages)} pages, {len(parts)} reports found", flush=True)
+            for page, text in parts:
+                reports.append((f"{f.name} p.{page}", f"{f.stem} p.{page}", text, f))
+        else:
+            reports.append((f.name, f.stem, parts[0][1], f))
+
+    for label, fallback_host, text, f in reports:
+        info, notes = extract_report(text, fallback_host, score_patterns, dayfirst=dayfirst)
+        problems += [f"{label}: {n}" for n in notes]
         if info is None:
             continue
 
@@ -303,7 +351,7 @@ def process(files, wb, fy_start_month=1, quarter=None, score_patterns=SCORE_PATT
         else:
             if rdate is None:
                 rdate = datetime.fromtimestamp(f.stat().st_mtime)
-                problems.append(f"{f.name}: no report date found in PDF, used the file's modified date "
+                problems.append(f"{label}: no report date found in PDF, used the file's modified date "
                                 f"{rdate.date()}. Use --quarter if that's wrong.")
             q = fiscal_quarter(rdate, fy_start_month)
 
@@ -338,9 +386,9 @@ def process(files, wb, fy_start_month=1, quarter=None, score_patterns=SCORE_PATT
             seen_this_run[slot] = rdate
             if action == "updated":
                 changed.add(slot)
-        results.append({"file": f.name, "host": info["host"], "bench": info["bench"],
+        results.append({"file": label, "host": info["host"], "bench": info["bench"],
                         "date": rdate, "quarter": q, "score": value, "action": action})
-        log.append([now, f.name, info["host"], info["bench"],
+        log.append([now, label, info["host"], info["bench"],
                     rdate.strftime("%Y-%m-%d") if rdate else "", q, value, action])
         for c in log[log.max_row][:4]:
             safe_text(c)
@@ -387,6 +435,9 @@ def main(argv=None):
     p.add_argument("--overwrite", action="store_true", help="Replace a score already recorded for that quarter")
     p.add_argument("--dry-run", action="store_true", help="Show what would change without saving")
     p.add_argument("--show-text", action="store_true", help="Print the extracted PDF text and stop")
+    p.add_argument("--split-on", default=DEFAULT_SPLIT,
+                   help='Word that starts each report in a multi-report PDF (default "Compliant"; '
+                        '"" = one report per PDF)')
     a = p.parse_args(argv)
 
     try:
@@ -422,11 +473,12 @@ def main(argv=None):
             raise CisError("--workbook must be an .xlsx file.")
         wb = open_workbook(wb_path)
         results, problems = process(files, wb, a.fy_start_month, a.quarter, score_patterns,
-                                    a.overwrite, a.dayfirst)
+                                    a.overwrite, a.dayfirst, a.split_on.strip())
 
-        print(f"{'File':<30} {'Host':<18} {'Quarter':<9} {'Score':>6}  Action")
+        print(f"{'File':<34} {'Host':<24} {'Quarter':<9} {'Score':>6}  Action")
         for r in results:
-            print(f"{r['file'][:30]:<30} {r['host'][:18]:<18} {r['quarter']:<9} {r['score']:>6.1f}  {r['action']}")
+            name = r["file"] if len(r["file"]) <= 34 else "..." + r["file"][-31:]   # keep the page number
+            print(f"{name:<34} {r['host'][:24]:<24} {r['quarter']:<9} {r['score']:>6.1f}  {r['action']}")
         for msg in problems:
             print("NOTE:", msg)
 
