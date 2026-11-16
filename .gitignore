@@ -1,0 +1,14 @@
+# Never commit audit data or results
+*.csv
+*.pdf
+*.xlsx
+*.xls
+*.txt
+!requirements.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
